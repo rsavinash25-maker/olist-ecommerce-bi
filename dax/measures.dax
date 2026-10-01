@@ -1,0 +1,55 @@
+// =====================================================================
+// Olist E-commerce BI — DAX measures (all stored in the _Measures table)
+// =====================================================================
+
+// ---------- Core sales (sales grain: fact_order_items) ----------
+// Counted from fact_order_items so product & seller slicing works correctly.
+Total Revenue = SUM(fact_order_items[price])
+Total Orders = DISTINCTCOUNT(fact_order_items[order_id])
+Total Customers = DISTINCTCOUNT(fact_order_items[customer_unique_id])
+Avg Order Value = DIVIDE([Total Revenue], [Total Orders])
+Total Freight = SUM(fact_order_items[freight_value])
+
+// Display-only measure for the KPI card (shows e.g. "13.54M")
+Total Revenue (R$) = FORMAT([Total Revenue] / 1000000, "0.00") & "M"
+
+// ---------- Time intelligence (dim_date is marked as the date table) ----------
+Revenue PY = CALCULATE([Total Revenue], SAMEPERIODLASTYEAR(dim_date[date]))
+
+// Only meaningful for a single year; returns BLANK otherwise
+Revenue YoY % =
+VAR _yoy = DIVIDE([Total Revenue] - [Revenue PY], [Revenue PY])
+RETURN IF(HASONEVALUE(dim_date[year]), _yoy)
+
+Revenue YTD = TOTALYTD([Total Revenue], dim_date[date])
+Orders PY = CALCULATE([Total Orders], SAMEPERIODLASTYEAR(dim_date[date]))
+
+Revenue 3M Rolling Avg =
+VAR _period = DATESINPERIOD(dim_date[date], MAX(dim_date[date]), -3, MONTH)
+RETURN DIVIDE(CALCULATE([Total Revenue], _period), 3)
+
+// ---------- Delivery (order grain: fact_orders) ----------
+Order Count = COUNTROWS(fact_orders)
+Delivered Orders = CALCULATE(COUNTROWS(fact_orders), fact_orders[is_delivered] = 1)
+Late Orders = CALCULATE(COUNTROWS(fact_orders), fact_orders[is_late] = 1)
+Late Delivery % = DIVIDE([Late Orders], [Delivered Orders])
+On-Time Delivery % = 1 - [Late Delivery %]
+Avg Delivery Days = AVERAGE(fact_orders[delivery_days])
+
+// ---------- Satisfaction ----------
+Avg Review Score = AVERAGE(fact_orders[review_score])
+
+Negative Review % =
+DIVIDE(
+    CALCULATE(COUNTROWS(fact_orders), fact_orders[review_score] <= 2),
+    COUNT(fact_orders[review_score])
+)
+
+// ---------- Customers & payments ----------
+Repeat Customer % =
+DIVIDE(
+    CALCULATE([Total Customers], dim_customer[customer_type] = "Repeat"),
+    [Total Customers]
+)
+
+Total Payments = SUM(fact_payments[payment_value])
