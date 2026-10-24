@@ -1,6 +1,9 @@
-# Olist E-commerce Business Intelligence Dashboard
+# Olist E-commerce Business Intelligence
 
-An end-to-end BI project on **~100K real e-commerce orders** from Olist, a Brazilian online marketplace. Raw data is cleaned in **Python**, modeled as a **star schema** in **Power BI**, analyzed with **20+ DAX measures**, and presented in a **3-page interactive report**.
+An end-to-end BI project on **~100K real e-commerce orders** from Olist, a Brazilian online marketplace, built in two versions:
+
+- **v1 – Python + Power BI:** raw data cleaned in **Python**, modeled as a **star schema** in **Power BI**, analyzed with **20+ DAX measures**, and presented in a **3-page interactive report**.
+- **v2 – Databricks:** the same pipeline rebuilt as a **bronze / silver / gold medallion pipeline** in Databricks (Delta tables, Unity Catalog) with **16 automated data-quality checks**. The gold layer **reconciles exactly** with the v1 dashboard, and **Databricks Genie** was evaluated against ground truth: **8/10 → 10/10** after adding business definitions.
 
 **Headline finding:** very late deliveries cut the average review score from **4.32 to 1.70** and make negative reviews **~9× more likely**, and **97% of customers never place a second order**. Fixing logistics in a handful of remote states is the biggest lever for satisfaction and retention.
 
@@ -20,14 +23,166 @@ An end-to-end BI project on **~100K real e-commerce orders** from Olist, a Brazi
 
 | Layer | Tools |
 |---|---|
-| Data engineering | Python (pandas, NumPy), Jupyter |
+| Data engineering (v1) | Python (pandas, NumPy), Jupyter |
+| Data engineering (v2) | Databricks Free Edition: PySpark notebooks, Delta tables, Unity Catalog, serverless SQL warehouse |
+| Data quality (v2) | 16 automated checks logged to a Delta table; pipeline stops on key failures |
+| Natural-language analytics (v2) | Databricks AI/BI Genie, evaluated against ground truth |
 | Data modeling | Power BI (Power Query, star schema, relationships, date table) |
 | Analytics | DAX (time intelligence, ratios, context-aware measures) |
 | Visualization | Power BI Desktop: KPI cards, slicers, Top-N filters, matrix with data bars |
 
 ---
 
-## 1. Data pipeline (Python)
+## v2: Databricks medallion pipeline
+
+```mermaid
+flowchart LR
+    A[9 raw CSVs<br/>Unity Catalog volume] --> B[Bronze<br/>raw strings + lineage columns]
+    B --> C[Silver<br/>typed, cleaned<br/>16 DQ checks]
+    C --> D[Gold<br/>star schema<br/>4 facts + 4 dims]
+    D --> E[Genie<br/>natural-language Q&A]
+    D -.-> F[Power BI<br/>via SQL warehouse<br/>next step]
+```
+
+### Setup
+
+- **Databricks Free Edition** (serverless compute, one 2X-Small SQL warehouse, non-commercial use).
+- Catalog `workspace`, schemas `olist_bronze`, `olist_silver`, `olist_gold`, and a `landing` volume for the raw files.
+- Three PySpark notebooks: `01_bronze_ingest`, `02_silver_clean`, `03_gold_star_schema`. They were tested on a local Spark engine before running in Databricks.
+
+### Bronze: land the data as-is
+
+Every column is kept as a string, plus two lineage columns, `_source_file` and `_ingested_at`. Row counts match the source files exactly:
+
+| Table | Rows | Table | Rows |
+|---|---|---|---|
+| orders | 99,441 | customers | 99,441 |
+| order_items | 112,650 | sellers | 3,095 |
+| payments | 103,886 | products | 32,951 |
+| reviews | 99,224 | geolocation | 1,000,163 |
+| category_translation | 71 | | |
+
+<!-- Screenshot: bronze row counts -->
+![Bronze row counts](images/v2/bronze_row_counts.png)
+
+### Silver: type, clean, and test
+
+Silver applies the same fixes as the v1 Python notebook (customer key, delivery metrics, review deduplication, category translation, geolocation cleanup) with proper data types.
+
+**16 data-quality checks** run on every load and are written to `olist_silver.dq_results`. They cover key uniqueness, key relationships between tables, non-negative prices and payments, review scores between 1 and 5, and delivery dates not before purchase dates. **The notebook stops if any key check fails**, so bad data never reaches gold. All 16 checks pass.
+
+### Gold: the star schema, documented
+
+Gold rebuilds the v1 star schema (`fact_orders`, `fact_order_items`, `fact_reviews`, `fact_payments`, `dim_customer`, `dim_product`, `dim_seller`, `dim_date`) with **table and column descriptions** in Unity Catalog, which both people and Genie use to understand the data.
+
+### Reconciliation: gold matches the v1 dashboard exactly
+
+| KPI (Jan 2017 – Aug 2018) | v1 dashboard | Gold layer |
+|---|---|---|
+| Total revenue (BRL) | 13.54M | 13,541,713 |
+| Total orders | 98K | 98,353 |
+| Late delivery % | 6.79% | 6.79% |
+| Avg review score | 4.09 | 4.09 |
+| Repeat customer % | 3.14% | 3.14% |
+
+<!-- Screenshot: gold reconciliation query -->
+![Gold reconciliation](images/v2/gold_reconciliation.png)
+
+---
+
+## v2: Evaluating Databricks Genie
+
+Genie answers business questions in plain English by writing SQL. Instead of a demo, it was tested like a model evaluation: **10 questions with known answers**, each designed to catch a specific mistake, graded **correct / partly right / wrong**.
+
+**Setup.** A Genie space on the 8 gold tables, using Chat mode and the serverless SQL warehouse. In round 1 Genie had **no instructions**, only the table and column descriptions from the gold layer. Genie's auto-suggested description and instructions were not accepted.
+
+**Ground truth.** All answers were computed from the same gold tables over all dates, so some differ slightly from the dashboard, which filters Jan 2017 – Aug 2018.
+
+### Results
+
+| # | Question | What it tests | Round 1 | After instructions |
+|---|---|---|---|---|
+| 1 | What was total revenue in 2017? | Adding freight or using payments | ✅ | ✅ |
+| 2 | How many orders were placed in 2018? | Distinct order counting | ✅ | ✅ |
+| 3 | What are the top 5 product categories by revenue? | Fact-to-dimension join | ✅ | ✅ |
+| 4 | Which customer states have the longest average delivery time? | Join + delivered-only filter | ✅ | ✅ |
+| 5 | What percentage of delivered orders arrived late? | Correct denominator | ✅ | ✅ |
+| 6 | Average review score for late vs on-time orders? | Grouping by a flag | ✅ | ✅ |
+| 7 | What percentage of customers placed more than one order? | Customer-ID trap | ✅ | ✅ |
+| 8 | Which month had the highest late delivery rate? | Time grouping | ❌ Sep 2016, 100% | ✅ Mar 2018, 18.96% |
+| 9 | What is the average order value? | Price-only vs payments | ❌ R$160.99 | ✅ R$137.75 |
+| 10 | Which payment method brings in the most money? | Simple aggregation | ✅ | ✅ |
+| | **Score** | | **8/10 (80%)** | **10/10 (100%)** |
+
+Full answers, ground truth and notes are in [`genie/genie_evaluation.xlsx`](genie/genie_evaluation.xlsx).
+
+### What went wrong, and why
+
+Genie got the **technical** parts right without help: joins, the delivered-only filter, distinct counts, and even the `customer_unique_id` trap. Both misses were about **business definitions**:
+
+- **Q8, the sparse-month trap.** September 2016 has only a handful of orders, so one late order gives a 100% late rate. The SQL was valid, but the answer is useless for the business. This is the same problem that led to the Jan 2017 – Aug 2018 window in the v1 dashboard.
+- **Q9, the definition trap.** Genie computed average order value from payments, which include freight and instalment interest. When re-run in a fresh chat it picked a *different* wrong definition (price + freight, R$160.58). **Without a written definition, Genie was not even consistent with itself.**
+
+<!-- Screenshots: Q8 before and after -->
+| Before instructions | After instructions |
+|---|---|
+| ![Q8 before](images/v2/genie_q8_before.png) | ![Q8 after](images/v2/genie_q8_after.png) |
+
+### Round 2: business instructions
+
+Plain-English definitions were added to the Genie space. They are general business rules, not answers to the test questions; the month-window rule is the same one used in the v1 dashboard.
+
+<details>
+<summary>Instructions given to Genie</summary>
+
+```
+Business definitions for the Olist marketplace (currency: BRL)
+
+Revenue
+- Revenue = SUM(fact_order_items.price). It excludes freight.
+- Do not use fact_payments for revenue. Payments include freight and instalment interest. Use fact_payments only for questions about payments or payment methods.
+
+Orders and order value
+- Orders = COUNT(DISTINCT order_id).
+- Average order value (AOV) = SUM(fact_order_items.price) / COUNT(DISTINCT fact_order_items.order_id). Price only: no freight, no payments.
+
+Customers
+- A customer is customer_unique_id, never customer_id (Olist creates a new customer_id for every order).
+- Repeat customer = a customer_unique_id with more than one distinct order.
+
+Delivery
+- Late delivery % and average delivery time use delivered orders only (is_delivered = 1).
+- On-time orders = delivered orders that were not late (this includes early deliveries). Do not use only delivery_bucket = 'On time' for this; that bucket means delivered exactly on the promised date.
+
+Reviews
+- Negative review = review score of 1 or 2 stars.
+
+Dates and time periods
+- Join facts to dim_date on order_date = dim_date.date.
+- For month-level analysis (trends, best or worst month, monthly rates), use only January 2017 to August 2018. Months before and after this window have very few orders and give misleading rates.
+```
+
+</details>
+
+**Regression check.** After adding the instructions, all 10 questions were asked again to make sure nothing that was already correct broke. In one run (several questions asked in the same chat) Q6 reported on-time reviews as 4.03, using only the narrow "delivered exactly on the promised day" bucket. Re-run in a fresh chat it gave the correct 4.29, both before and after an explicit on-time definition was added. Final result: **10/10, with no reproducible regressions.**
+
+### Lessons
+
+1. **Good metadata gets you far.** With only table and column descriptions, Genie scored 8/10 and handled the classic Olist customer-ID trap on its own.
+2. **Definitions, not SQL, are the gap.** Every miss was a business-definition question: which months count, and what "order value" means.
+3. **Instructions fix this cheaply,** but they must be general rules, and every change needs a regression check.
+4. **Test in fresh chats.** Earlier questions in the same chat can change later answers.
+
+### Limitations
+
+- One run per question (two for the misses), so this measures typical behaviour, not a statistical accuracy rate. Genie's answers can vary between runs.
+- 10 questions is a small test set, designed to probe specific known traps.
+
+---
+
+## v1: Python pipeline and Power BI report
+
+### 1. Data pipeline (Python)
 
 Source: the [Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) on Kaggle, which has 9 relational tables covering orders, items, payments, reviews, customers, sellers, products, geolocation, and category translations.
 
@@ -40,7 +195,7 @@ The notebook [`notebooks/olist_data_cleaning.ipynb`](notebooks/olist_data_cleani
 - **Cleaned geolocation:** removed coordinates outside Brazil and averaged to one point per zip prefix.
 - **Built a full-year date table** (2016–2018) so DAX time intelligence works correctly.
 
-## 2. Data model (star schema)
+### 2. Data model (star schema)
 
 ```mermaid
 erDiagram
@@ -70,7 +225,7 @@ erDiagram
 - `fact_orders` and `fact_order_items` deliberately have **no direct relationship**. They connect only through shared dimensions, so filters behave predictably.
 - All measures live in a dedicated **`_Measures` table**.
 
-## 3. DAX highlights
+### 3. DAX highlights
 
 All measures are in [`dax/measures.dax`](dax/measures.dax). The Power BI file itself is available under [Releases](https://github.com/rsavinash25-maker/olist-ecommerce-bi/releases/latest). A few worth noting:
 
@@ -92,17 +247,17 @@ RETURN DIVIDE(CALCULATE([Total Revenue], _period), 3)
 
 **Grain-aware counting.** Sales measures count from `fact_order_items` so they slice correctly by product and seller, while delivery and review measures use `fact_orders`.
 
-## 4. Report pages
+### 4. Report pages
 
 The analysis window is **Jan 2017 – Aug 2018**. The sparse first and last months are filtered out so trends don't show artificial drops. A synced **year slicer** works across all pages.
 
-### Executive Overview
-Revenue, orders, average order value, review score, on-time delivery, the monthly revenue trend, top categories, and the delivery-vs-review relationship.
+#### Executive Overview
+Revenue, orders, average order value, review score, on-time delivery, the monthly revenue trend, top categories, and the delivery-vs-review relationship (shown at the top of this README).
 
-### Sales & Customers
+#### Sales & Customers
 ![Sales & Customers](images/02_sales_customers.png)
 
-### Delivery & Satisfaction
+#### Delivery & Satisfaction
 ![Delivery & Satisfaction](images/03_delivery_satisfaction.png)
 
 A full PDF export of all three pages is in [`reports/Olist_BI_Dashboard.pdf`](reports/Olist_BI_Dashboard.pdf), and the `.pbix` file can be downloaded from [Release v1.0](https://github.com/rsavinash25-maker/olist-ecommerce-bi/releases/latest).
@@ -150,25 +305,39 @@ A full PDF export of all three pages is in [`reports/Olist_BI_Dashboard.pdf`](re
 ```
 ├── README.md
 ├── notebooks/
-│   └── olist_data_cleaning.ipynb    # Python pipeline: raw CSVs → star schema
+│   └── olist_data_cleaning.ipynb    # v1 Python pipeline: raw CSVs → star schema
+├── genie/
+│   └── genie_evaluation.xlsx        # Genie test set, answers, grades, method
 ├── dax/
 │   └── measures.dax                 # All DAX measures
 ├── reports/
 │   └── Olist_BI_Dashboard.pdf       # PDF export of all pages
 └── images/                          # Report screenshots
+    └── v2/                          # Databricks and Genie screenshots
 ```
 
 ## How to reproduce
 
+**v1 (Python + Power BI)**
 1. Download the dataset from [Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) and place the 9 CSVs in a folder named `olist_raw` next to the notebook.
 2. Run `notebooks/olist_data_cleaning.ipynb`. It writes 8 cleaned CSVs to `olist_clean/`.
 3. Download `Olist_BI_Platform.pbix` from [Release v1.0](https://github.com/rsavinash25-maker/olist-ecommerce-bi/releases/latest) and open it in Power BI Desktop (Windows). If prompted, point the data source to your `olist_clean` folder (**Transform data → Data source settings**) and refresh.
 
-The data files aren't included in this repo because of their size. The notebook regenerates them.
+**v2 (Databricks)**
+1. Create a free [Databricks Free Edition](https://www.databricks.com/learn/free-edition) account.
+2. Create the schemas `olist_bronze`, `olist_silver`, `olist_gold` in the `workspace` catalog, and a volume `landing` in `olist_bronze`.
+3. Upload the 9 raw CSVs to the volume.
+4. Run the three notebooks in order (bronze → silver → gold). The silver step stops if a key data-quality check fails.
+5. Optional: create a Genie space on the 8 `olist_gold` tables and ask the questions in `genie/genie_evaluation.xlsx`.
+
+The data files aren't included in this repo because of their size. The notebooks regenerate them.
 
 ## Roadmap
 
-- [ ] Move the pipeline into a SQL database (bronze / silver / gold layers)
+- [x] Rebuild the pipeline as bronze / silver / gold layers (Databricks)
+- [x] Automated data-quality checks and reconciliation against the dashboard
+- [x] Evaluate Databricks Genie against ground truth
+- [ ] Connect Power BI Desktop to the gold tables through the SQL warehouse and confirm the report numbers match
 - [ ] RFM customer segmentation and cohort retention analysis
 - [ ] Sentiment analysis on review text
 - [ ] Sales forecasting
@@ -180,4 +349,4 @@ Data: [Olist Brazilian E-Commerce Public Dataset](https://www.kaggle.com/dataset
 
 ---
 
-**Author:** Avinash Rajasekar · [LinkedIn](#) · [Email](#)
+**Author:** Avinash Rajasekar
